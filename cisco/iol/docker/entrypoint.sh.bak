@@ -1,0 +1,134 @@
+#!/bin/bash
+
+IOL_PID=${IOL_PID:-1}
+
+echo "Launching IOL with PID" $IOL_PID
+
+# Detect IOL version based on binary architecture
+# IOL 15.x = 32-bit ELF, IOL 17.x = 64-bit ELF
+# Check ELF header: byte 5 is 1 for 32-bit, 2 for 64-bit
+IS_LEGACY_IOL=false
+ELF_CLASS=$(od -An -t x1 -j 4 -N 1 /iol/iol.bin 2>/dev/null | tr -d ' ')
+if [ "$ELF_CLASS" = "01" ]; then
+    IS_LEGACY_IOL=true
+    echo "Detected legacy IOL (32-bit) - using enhanced startup"
+else
+    echo "Detected modern IOL (64-bit) - using standard startup"
+fi
+
+if [ "$IS_LEGACY_IOL" = true ]; then
+    # ============================================
+    # IOL 15.x (32-bit) - Requires special handling
+    # ============================================
+
+    # Generate IOL license (required for 15.x)
+    export HOME=/iol
+    export IOURC=/iol/.iourc
+    python3 /gen_license.py
+
+    if [ -f /iol/.iourc ]; then
+        echo "License file created:"
+        cat /iol/.iourc
+    else
+        echo "WARNING: Failed to create license file"
+    fi
+
+    # EEM applet to generate SSH keys after boot
+    # IOL 15.x ignores "crypto key generate rsa" in startup-config
+    # Using syslog trigger (fires on system restart message, ~2s vs ~60s for @reboot)
+    EEM_APPLET='!
+event manager session cli username admin
+event manager applet EEM_SSH_Keygen
+ event syslog occurs 1 pattern "%SYS-5-RESTART" maxrun 120
+ action 0.0 info type routername
+ action 0.1 set status "none"
+ action 1.0 cli command "enable"
+ action 2.0 cli command "show ip ssh | include ^SSH"
+ action 2.1 regexp "([ED][^ ]+)" "$_cli_result" result status
+ action 3.0 if $status eq Disabled
+ action 3.1  cli command "configure terminal"
+ action 3.2  cli command "crypto key generate rsa modulus 2048 label $_info_routername"
+ action 3.3  cli command "end"
+ action 3.4 end
+!'
+
+    # IOL 15.x ignores -c flag, must inject config into NVRAM
+    if [ -f /iol/config.txt ]; then
+        echo "Found config.txt, injecting EEM applet and importing to NVRAM..."
+
+        # Check if EEM applet already present
+        if grep -q "event manager applet EEM_SSH_Keygen" /iol/config.txt; then
+            echo "EEM applet already present in config"
+            cp /iol/config.txt /tmp/config_with_eem.txt
+        else
+            # Insert EEM applet before the final "end" statement
+            sed '/^end$/d' /iol/config.txt > /tmp/config_with_eem.txt
+            echo "$EEM_APPLET" >> /tmp/config_with_eem.txt
+            echo "end" >> /tmp/config_with_eem.txt
+            echo "Injected EEM applet for SSH key generation"
+        fi
+
+        # Create NVRAM file (64KB) with startup config injected
+        /iou_import -c 64 /iol/nvram_00001 /tmp/config_with_eem.txt
+        if [ $? -eq 0 ]; then
+            echo "Successfully injected config into NVRAM"
+        else
+            echo "WARNING: Failed to inject config into NVRAM"
+        fi
+    else
+        echo "No config.txt found, creating minimal NVRAM with SSH support..."
+        cat > /tmp/minimal.cfg << 'MINEOF'
+!
+hostname Router
+ip domain name local
+username admin privilege 15 secret admin
+!
+event manager session cli username admin
+event manager applet EEM_SSH_Keygen
+ event syslog occurs 1 pattern "%SYS-5-RESTART" maxrun 120
+ action 0.0 info type routername
+ action 0.1 set status "none"
+ action 1.0 cli command "enable"
+ action 2.0 cli command "show ip ssh | include ^SSH"
+ action 2.1 regexp "([ED][^ ]+)" "$_cli_result" result status
+ action 3.0 if $status eq Disabled
+ action 3.1  cli command "configure terminal"
+ action 3.2  cli command "crypto key generate rsa modulus 2048 label $_info_routername"
+ action 3.3  cli command "end"
+ action 3.4 end
+!
+ip ssh version 2
+line vty 0 4
+ login local
+ transport input ssh
+!
+end
+MINEOF
+        /iou_import -c 64 /iol/nvram_00001 /tmp/minimal.cfg
+    fi
+else
+    # ============================================
+    # IOL 17.x (64-bit) - Standard startup
+    # ============================================
+    # No license needed, -c flag works, crypto key works in startup-config
+    echo "Using standard IOL startup (no NVRAM injection needed)"
+fi
+
+# Clear IP addressing on eth0 (it 'belongs' to IOL now)
+ip addr flush dev eth0
+ip -6 addr flush dev eth0
+
+echo "Flushed eth0 addresses"
+
+sleep 5
+
+# Run IOUYAP
+exec /usr/bin/iouyap 513 -q &
+
+# Get the highest numbered eth interface
+max_eth=$(ls /sys/class/net | grep eth | grep -o -E "[0-9]+" | sort -n | tail -1)
+num_slots=$(( (max_eth + 4) / 4 ))
+
+# Start IOL
+# -c config.txt: Works for 17.x, ignored by 15.x (which uses NVRAM)
+exec /iol/iol.bin $IOL_PID -e $num_slots -s 0 -c config.txt -n 1024
