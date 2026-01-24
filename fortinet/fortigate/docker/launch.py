@@ -9,6 +9,10 @@ import uuid
 
 import vrnetlab
 
+# Default password that meets FortiOS password policy requirements:
+# min 12 chars, 1 uppercase, 1 lowercase, 1 number, 1 non-alphanumeric
+DEFAULT_PASSWORD = "Admin123!@#$"
+
 
 def handle_SIGCHLD(_unused_signal, _unused_frame):
     os.waitpid(-1, os.WNOHANG)
@@ -58,6 +62,7 @@ class FortiOS_vm(vrnetlab.VM):
         self.qemu_args.extend(["-uuid", os.getenv("FORTIGATE_UUID") or str(uuid.uuid4())])
         self.spins = 0
         self.running = None
+        self.login_attempt = 0  # Track login attempts for fallback
 
         # set up the extra empty disk image
         # for fortigate logs
@@ -84,22 +89,33 @@ class FortiOS_vm(vrnetlab.VM):
             self.stop()
             self.start()
             self.spins = 0
+            self.login_attempt = 0
             return
 
-        (ridx, match, res) = self.tn.expect([b"login:", b"FortiGate-VM64-KVM #"], 1)
+        (ridx, match, res) = self.tn.expect(
+            [b"login:", b"FortiGate-VM64-KVM #", b"New Password:"], 1
+        )
         if match:  # got a match!
             if ridx == 0:  # matched login prompt, so should login
                 self.logger.debug("ridx == 0")
-                self.logger.info("matched login prompt")
+                self.logger.info(f"matched login prompt (attempt {self.login_attempt})")
+                self.login_attempt += 1
 
                 self.wait_write(self.username, wait=None)
                 self.wait_write("", wait=self.username)
-                self.wait_write(self.password, wait="Password")
-                self.wait_write(self.password, wait=None)
+                
+                # Try empty password first (newer FortiOS 7.x+)
+                # If this fails, we'll see login: again and try "admin" (older FortiOS)
+                if self.login_attempt <= 1:
+                    self.logger.info("trying empty password (FortiOS 7.x+ first login)")
+                    self.wait_write("", wait="Password")
+                else:
+                    # Fallback for older FortiOS that uses admin/admin
+                    self.logger.info("trying 'admin' password (older FortiOS fallback)")
+                    self.wait_write("admin", wait="Password")
 
             if ridx == 1:
-                # if we dont match the FortiGate-VM64-KVM # we assume we already have some configuration and
-                # may continue with configure the system to our needs.
+                # Matched the CLI prompt - we're logged in and ready
                 self.logger.debug("ridx == 1")
                 self.wait_write("config system global", wait=None)
                 hostname_command = "set hostname " + self.hostname
@@ -111,6 +127,15 @@ class FortiOS_vm(vrnetlab.VM):
                 startup_time = datetime.datetime.now() - self.start_time
                 self.logger.info(f"Startup complete in { startup_time }")
                 return
+
+            if ridx == 2:  # matched "New Password:" prompt - handle password change
+                self.logger.debug("ridx == 2")
+                self.logger.info("matched new password prompt - setting new password")
+                # Send the new password
+                self.wait_write(self.password, wait=None)
+                # Confirm the new password
+                self.wait_write(self.password, wait="Confirm Password:")
+                self.logger.info("password change completed")
 
         else:
             # no match, if we saw some output from the router it's probably
@@ -158,7 +183,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--hostname", default="vr-fortinet", help="Fortinet hostname")
     parser.add_argument("--username", default="admin", help="Username")
-    parser.add_argument("--password", default="admin", help="Password")
+    parser.add_argument("--password", default=DEFAULT_PASSWORD, help="Password")
     parser.add_argument(
         "--connection-mode",
         default="tc",
@@ -173,8 +198,21 @@ if __name__ == "__main__":
     logger.setLevel(logging.DEBUG)
     if args.trace:
         logger.setLevel(1)
+
+    # Determine password to use:
+    # 1. If PASSWORD env is set and is NOT "admin", use it (user override)
+    # 2. Otherwise use DEFAULT_PASSWORD (policy-compliant)
+    # This handles ContainerLab setting PASSWORD=admin by default
+    env_password = os.getenv("PASSWORD")
+    if env_password and env_password != "admin":
+        password = env_password
+        logger.info(f"Using custom password from PASSWORD env")
+    else:
+        password = DEFAULT_PASSWORD
+        logger.info(f"Using default password (Admin123!@#$)")
+
     vrnetlab.boot_delay()
     vr = FortiOS(
-        args.hostname, args.username, args.password, conn_mode=args.connection_mode
+        args.hostname, args.username, password, conn_mode=args.connection_mode
     )
     vr.start()
