@@ -5,9 +5,14 @@ import os
 import re
 import signal
 import sys
+import telnetlib
+import time
 import uuid
 
 import vrnetlab
+
+
+STARTUP_CONFIG_FILE = "/config/startup-config.cfg"
 
 
 def handle_SIGCHLD(_unused_signal, _unused_frame):
@@ -116,6 +121,8 @@ class FortiOS_vm(vrnetlab.VM):
                 hostname_command = "set hostname " + self.hostname
                 self.wait_write(hostname_command, wait="global")
                 self.wait_write("end", wait=hostname_command)
+                # Apply startup config if it exists
+                self.startup_config()
                 self.running = True
                 self.tn.close()
                 startup_time = datetime.datetime.now() - self.start_time
@@ -144,6 +151,39 @@ class FortiOS_vm(vrnetlab.VM):
                 self.spins = 0
 
         self.spins += 1
+
+    def startup_config(self):
+        """Load additional config provided by user via startup-config.cfg file.
+
+        ContainerLab mounts the startup config at /config/startup-config.cfg.
+        This method reads the file and applies each line via serial console.
+        """
+        if not os.path.exists(STARTUP_CONFIG_FILE):
+            self.logger.trace(f"Startup config file {STARTUP_CONFIG_FILE} not found, skipping")
+            return
+
+        self.logger.info(f"Found startup config file {STARTUP_CONFIG_FILE}")
+
+        with open(STARTUP_CONFIG_FILE) as file:
+            config_lines = file.readlines()
+            config_lines = [line.rstrip() for line in config_lines if line.strip()]
+
+        if not config_lines:
+            self.logger.trace("Startup config file is empty, skipping")
+            return
+
+        self.logger.info(f"Applying {len(config_lines)} lines from startup config")
+
+        # Apply each config line
+        for line in config_lines:
+            self.logger.trace(f"Applying config: {line}")
+            self.wait_write(line, wait=None)
+            # Small delay to let FortiOS process each command
+            time.sleep(0.1)
+
+        # Wait a bit for config to settle
+        time.sleep(1)
+        self.logger.info("Startup config applied successfully")
 
     def _wait_reset(self):
         """
