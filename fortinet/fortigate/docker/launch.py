@@ -3,6 +3,7 @@ import datetime
 import logging
 import os
 import re
+import shutil
 import signal
 import sys
 import telnetlib
@@ -153,10 +154,19 @@ class FortiOS_vm(vrnetlab.VM):
         self.spins += 1
 
     def startup_config(self):
-        """Load additional config provided by user via startup-config.cfg file.
+        """Load user config from /config/startup-config.cfg.
 
         ContainerLab mounts the startup config at /config/startup-config.cfg.
-        This method reads the file and applies each line via serial console.
+        Two shapes are supported:
+
+        - A FULL FortiOS backup (first line ``#config-version=...``) is
+          restored atomically via ``execute restore config tftp`` — FortiOS
+          downloads it, validates it, applies the whole file and reboots.
+          Blind serial replay silently truncates such a file (thousands of
+          lines) so it must NOT be typed line by line.
+        - A PARTIAL config (no header) is applied line by line over the
+          serial console — reliable for the small deltas the NetPilot agent
+          authors, and needs no reboot.
         """
         if not os.path.exists(STARTUP_CONFIG_FILE):
             self.logger.trace(f"Startup config file {STARTUP_CONFIG_FILE} not found, skipping")
@@ -165,11 +175,15 @@ class FortiOS_vm(vrnetlab.VM):
         self.logger.info(f"Found startup config file {STARTUP_CONFIG_FILE}")
 
         with open(STARTUP_CONFIG_FILE) as file:
-            config_lines = file.readlines()
-            config_lines = [line.rstrip() for line in config_lines if line.strip()]
+            config_lines = [line.rstrip() for line in file if line.strip()]
 
         if not config_lines:
             self.logger.trace("Startup config file is empty, skipping")
+            return
+
+        # Full backup → native restore (atomic, verified by FortiOS itself).
+        if config_lines[0].startswith("#config-version="):
+            self.restore_full_config()
             return
 
         self.logger.info(f"Applying {len(config_lines)} lines from startup config")
@@ -184,6 +198,79 @@ class FortiOS_vm(vrnetlab.VM):
         # Wait a bit for config to settle
         time.sleep(1)
         self.logger.info("Startup config applied successfully")
+
+    TFTP_SERVER = "10.0.0.2"
+
+    def _wait_mgmt_ready(self, attempts=40):
+        """Wait until the mgmt interface can reach the TFTP server.
+
+        FortiOS reaches the CLI prompt BEFORE port1 finishes DHCP and
+        installs its route, so an immediate ``execute restore ... tftp``
+        fails with "Network is unreachable". Ping-gate on the QEMU user-net
+        gateway until it answers before attempting the transfer.
+        """
+        marker = b"bytes from " + self.TFTP_SERVER.encode()
+        for _ in range(attempts):
+            self.wait_write(f"execute ping {self.TFTP_SERVER}", wait=None)
+            (ridx, match, _res) = self.tn.expect(
+                [marker, b"100% packet loss", b"unreachable"], 8
+            )
+            if match and ridx == 0:
+                self.logger.info("mgmt interface reachable; TFTP server pingable")
+                return True
+            time.sleep(3)
+        self.logger.error("mgmt interface never became reachable for TFTP")
+        return False
+
+    def restore_full_config(self):
+        """Restore a full FortiOS backup via QEMU's built-in TFTP server.
+
+        QEMU serves ``/tftpboot`` to the guest at the user-mode-net gateway
+        ``10.0.0.2`` (the ``tftp=/tftpboot`` netdev option in
+        ``common/vrnetlab.py``). ``execute restore config`` downloads the
+        file, validates it, applies it transactionally and reboots — so we
+        wait for the box to come back before declaring startup complete.
+        """
+        os.makedirs("/tftpboot", exist_ok=True)
+        shutil.copy(STARTUP_CONFIG_FILE, "/tftpboot/restore.conf")
+
+        if not self._wait_mgmt_ready():
+            self.logger.error(
+                "TFTP server unreachable; cannot restore full config"
+            )
+            return
+
+        self.logger.info(
+            "Restoring full config via TFTP (execute restore config tftp)"
+        )
+        self.wait_write(
+            f"execute restore config tftp restore.conf {self.TFTP_SERVER}",
+            wait=None,
+        )
+        # FortiOS warns it will overwrite + reboot and asks to confirm.
+        self.wait_write("y", wait="(y/n)")
+        # On success FortiOS validates the file then reboots ("Please stand
+        # by while rebooting the system."); on failure it prints an error and
+        # stays at the prompt.
+        (ridx, match, _res) = self.tn.expect(
+            [
+                b"rebooting the system",
+                b"Can not get file",
+                b"Invalid",
+                b"command parse error",
+            ],
+            120,
+        )
+        if not match or ridx != 0:
+            self.logger.error(
+                "restore did not confirm reboot; full config may not have applied"
+            )
+            return
+        self.logger.info("Restore accepted; waiting for reboot to complete")
+        if self._wait_reset():
+            self.logger.info("Full config restored successfully")
+        else:
+            self.logger.error("Timed out waiting for reboot after restore")
 
     def _wait_reset(self):
         """
