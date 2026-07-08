@@ -188,16 +188,71 @@ class FortiOS_vm(vrnetlab.VM):
 
         self.logger.info(f"Applying {len(config_lines)} lines from startup config")
 
-        # Apply each config line
+        # Apply each config line, checking the serial echo for rejections.
+        # FortiOS prints errors like "node_check_object fail!" when it refuses
+        # a line (e.g. a policy srcintf naming a raw port that is bound to a
+        # zone); a blind write-only replay swallows those and boots a device
+        # that is silently missing config.
+        rejected = []
         for line in config_lines:
             self.logger.trace(f"Applying config: {line}")
             self.wait_write(line, wait=None)
             # Small delay to let FortiOS process each command
             time.sleep(0.1)
+            rejected.extend(self._scan_config_errors(line))
 
-        # Wait a bit for config to settle
+        # Wait a bit for config to settle, then catch any trailing errors
         time.sleep(1)
-        self.logger.info("Startup config applied successfully")
+        rejected.extend(self._scan_config_errors("<end of config>"))
+
+        if rejected:
+            for line, err in rejected:
+                self.logger.error(f"FortiOS REJECTED config near {line!r}: {err}")
+            self.logger.error(
+                f"STARTUP CONFIG INCOMPLETE: {len(rejected)} of "
+                f"{len(config_lines)} lines rejected by FortiOS (see errors above)"
+            )
+        else:
+            self.logger.info("Startup config applied successfully")
+
+    # FortiOS CLI error markers indicating a rejected/failed config line.
+    # Scanned against the raw serial echo — deliberately NOT prompt-matched,
+    # since config content can contain '#' (the scrapli prompt-truncation trap).
+    CONFIG_ERROR_MARKERS = (
+        b"node_check_object fail",
+        b"command parse error",
+        b"Command fail",
+        b"value parse error",
+        b"Unknown action",
+        b"entry not found",
+        b"please use zone name",
+    )
+
+    def _scan_config_errors(self, line):
+        """Drain the console echo (non-blocking) and return [(line, error)]
+        for any FortiOS error markers found. Attribution can lag by one line
+        (the echo is read after the next write), so the raw echoed text is
+        included as ground truth."""
+        try:
+            echoed = self.tn.read_very_eager()
+        except EOFError:
+            return []
+        if not echoed:
+            return []
+        hits = []
+        low = echoed.lower()
+        for marker in self.CONFIG_ERROR_MARKERS:
+            if marker.lower() in low:
+                # collapse \r\n serial echo into one log-friendly line
+                parts = [
+                    p.strip()
+                    for p in echoed.decode(errors="replace").splitlines()
+                    if p.strip()
+                ]
+                snippet = " | ".join(parts)
+                hits.append((line, snippet[-300:]))
+                break
+        return hits
 
     TFTP_SERVER = "10.0.0.2"
 
