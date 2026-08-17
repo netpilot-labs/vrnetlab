@@ -1,5 +1,5 @@
 VENDOR=Aruba
-NAME=ArubaOS-CX
+NAME=aoscx
 IMAGE_FORMAT=vmdk
 IMAGE_GLOB=*.vmdk
 
