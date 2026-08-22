@@ -266,7 +266,8 @@ topology:
   interface-alias mapping, so `ethernet1/1/1`-style endpoint names fail the
   deploy. `eth1` corresponds to CLI interface `ethernet 1/1/1`, `eth2` to
   `ethernet 1/1/2`, and so on, in order.
-* Each node commits 4 GiB RAM / 1 vCPU to its inner QEMU. Boot takes roughly
+* Each node commits 4 GiB RAM / 4 vCPUs to its inner QEMU (`launch.py` passes
+  `ram=4096, smp="4"`). Boot takes roughly
   1.5–3 minutes per node; a node is ready when `docker logs clab-<lab>-<node>`
   prints `Startup complete`.
 * Log in with `admin`/`admin` (SSH to the node's management address). A
