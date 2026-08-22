@@ -11,7 +11,7 @@ IMAGE_GLOB=*.qcow2
 # through unchanged, so VERSION==IMAGE and the docker-build sanity check
 # fails loud. `dellftos.latest.qcow2` → `latest` is deliberate — NetPilot's
 # BYOI build stages exactly that name when no version is given.
-VERSION=$(shell echo $(IMAGE) | sed -e 's/^dellftos\.\([0-9A-Za-z._-][0-9A-Za-z._-]*\)\.qcow2$$/\1/')
+VERSION=$(shell echo $(IMAGE) | sed -e 's/^dellftos\.\([0-9A-Za-z_][0-9A-Za-z._-]\{0,127\}\)\.qcow2$$/\1/')
 
 -include ../../makefile-sanity.include
 -include ../../makefile.include
