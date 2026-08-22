@@ -14,6 +14,20 @@ For the example, we'll be building 10.5.4.0.98 and the S5248F hardware.
 
 1. Unzip `OS10_Virtualization_{VERSION}.zip`.
 2. Decide which platform you want to use.
+
+> **Broken `OS10-Disk-1.0.0.vmdk` in some Dell bundles:** several bundle
+> builds (10.6.1.1.67V and 10.5.5.17.356V confirmed) ship
+> `OS10-Disk-1.0.0.vmdk` as a 77-byte JSON `401 Unauthorized` error body
+> captured from the dead force10networks.com portal — the `.gns3a` manifest
+> lists that size/md5, so every copy of an affected bundle has it.
+> **The file is the ONIE BOOT DISK (GRUB + ONIE runtime, 50 GiB virtual /
+> ~26 MiB sparse), not a blank target** — recreating it blank leaves the VM
+> with nothing bootable (the installer vmdk is payload-only: no boot code,
+> just `onie-installer` + `os10.bin`). Fix: take `OS10-Disk-1.0.0.vmdk` from
+> a bundle whose copy is intact (10.5.6.14.347V confirmed good) — the disk is
+> version-independent and pairs fine with any release's installer/platform
+> vmdks.
+
 3. Run qemu to build the image
 
 ```bash
@@ -218,10 +232,12 @@ Once this is complete, you'll be left with a qcow2 image that can then be built 
 
 ## Building the docker image
 
-Put the .qcow2 file in this directory and run make docker-image and you should be good to go. The resulting image is 
-called `vr-ftosv`. You can tag it with something else if you want, like `my-repo.example.com/vr-ftosv` and then push it to 
-your repo. The tag is the same as the version of the FTOS image, so if you have `dellftos.10.5.2.4.qcow2` your final docker 
-image will be called `vr-ftosv:10.5.2.4`
+Name the .qcow2 file `dellftos.{version}.qcow2` (the Makefile derives the tag
+by stripping that prefix/suffix — any other name fails the sanity check), put
+it in this directory, and run `make docker-image`. The resulting image is
+called `vrnetlab/dell_ftosv`, matching the containerlab kind (same convention
+as `aruba_aoscx`). So `dellftos.10.6.1.1.qcow2` builds
+`vrnetlab/dell_ftosv:10.6.1.1`.
 
 NOTE:
 
