@@ -15,15 +15,18 @@ For the example, we'll be building 10.5.4.0.98 and the S5248F hardware.
 1. Unzip `OS10_Virtualization_{VERSION}.zip`.
 2. Decide which platform you want to use.
 
-> **Broken `OS10-Disk-1.0.0.vmdk` in Dell's bundle:** at least the 10.6.1.1
-> bundle ships `OS10-Disk-1.0.0.vmdk` as a 77-byte JSON `401 Unauthorized`
-> error body, not a VMDK — Dell's own `.gns3a` manifest lists that size/md5,
-> so every copy has it and re-downloading does not help. The file is only the
-> blank install-target disk; recreate it before booting the installer:
->
-> ```bash
-> qemu-img create -f vmdk OS10-Disk-1.0.0.vmdk 32G
-> ```
+> **Broken `OS10-Disk-1.0.0.vmdk` in some Dell bundles:** several bundle
+> builds (10.6.1.1.67V and 10.5.5.17.356V confirmed) ship
+> `OS10-Disk-1.0.0.vmdk` as a 77-byte JSON `401 Unauthorized` error body
+> captured from the dead force10networks.com portal — the `.gns3a` manifest
+> lists that size/md5, so every copy of an affected bundle has it.
+> **The file is the ONIE BOOT DISK (GRUB + ONIE runtime, 50 GiB virtual /
+> ~26 MiB sparse), not a blank target** — recreating it blank leaves the VM
+> with nothing bootable (the installer vmdk is payload-only: no boot code,
+> just `onie-installer` + `os10.bin`). Fix: take `OS10-Disk-1.0.0.vmdk` from
+> a bundle whose copy is intact (10.5.6.14.347V confirmed good) — the disk is
+> version-independent and pairs fine with any release's installer/platform
+> vmdks.
 
 3. Run qemu to build the image
 
