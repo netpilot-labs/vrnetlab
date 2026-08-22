@@ -244,6 +244,36 @@ NOTE:
 * Dell officially does not provide .qcow2 disk images. Check Dell OS10 virtualization documentation on how to prepare disk image from officially available virtualization package. One can use either GNS3 or EVE-NG to prepare .qcow2 disk.
 * Number of interfaces are dependent on FTOS platform used in .qcow2 disk. By default, number of interfaces set under `launch.py` is `56` based on S5248 platform.
 
+## Using with containerlab
+
+The built image runs as containerlab kind `dell_ftosv`:
+
+```yaml
+name: os10-pair
+topology:
+  nodes:
+    sw1:
+      kind: dell_ftosv
+      image: vrnetlab/dell_ftosv:10.6.1.1
+    sw2:
+      kind: dell_ftosv
+      image: vrnetlab/dell_ftosv:10.6.1.1
+  links:
+    - endpoints: ["sw1:eth1", "sw2:eth1"]
+```
+
+* **Link endpoints MUST use the raw `ethN` names.** The kind has no
+  interface-alias mapping, so `ethernet1/1/1`-style endpoint names fail the
+  deploy. `eth1` corresponds to CLI interface `ethernet 1/1/1`, `eth2` to
+  `ethernet 1/1/2`, and so on, in order.
+* Each node commits 4 GiB RAM / 1 vCPU to its inner QEMU. Boot takes roughly
+  1.5–3 minutes per node; a node is ready when `docker logs clab-<lab>-<node>`
+  prints `Startup complete`.
+* Log in with `admin`/`admin` (SSH to the node's management address). A
+  `startup-config` bound via the node's `startup-config` property is replayed
+  line-by-line into `configure terminal` on boot — supply bare config lines,
+  without `configure terminal`/`end` wrappers.
+
 ## System requirements
 
 * CPU: 4 core
