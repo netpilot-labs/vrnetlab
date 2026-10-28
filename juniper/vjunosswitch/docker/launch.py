@@ -131,7 +131,11 @@ class VJUNOSSWITCH_vm(vrnetlab.VM):
 
     def bootstrap_spin(self):
         """This function should be called periodically to do work."""
-        if self.spins > 300:
+        # Junos 26.x sends its boot output to /boot/console.log, so the serial
+        # console stays silent for ~10 min under nested virtualization — 300
+        # silent spins restarted a VM that was still booting, every time
+        # (golden-setup-vjunos-bench, 2026-10-28). Allow ~30 min of silence.
+        if self.spins > 1800:
             # too many spins with no result ->  give up
             self.stop()
             self.start()
