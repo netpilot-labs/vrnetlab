@@ -83,9 +83,53 @@ def boot_delay():
         time.sleep(int(delay))
 
 
+def find_disk_image(directory: str = "/") -> str:
+    """Locate the VM's base disk image in the given directory.
+
+    Only files matching the base image are returned. Overlays created by
+    vrnetlab on (re)starts (`<name>-overlay.qcow2`) and hardlink aliases
+    that containerlab creates on container stop (`clab-<tag>.qcow2`) are
+    skipped, so that the same base image - and thereby the same overlay -
+    is discovered on every start of the container. This keeps VM state
+    (e.g. saved configs) persistent across container restarts.
+    """
+    candidates = []
+    for entry in sorted(os.listdir(directory)):
+        if not entry.endswith(".qcow2"):
+            continue
+        if entry.endswith("-overlay.qcow2"):
+            continue  # vrnetlab overlay image
+        if entry.startswith("clab-"):
+            continue  # containerlab pre-stop hardlink alias
+        candidates.append(os.path.join(directory, entry))
+
+    if not candidates:
+        raise FileNotFoundError(
+            f"No disk image found in {directory}: no .qcow2 file present"
+        )
+
+    if len(candidates) > 1:
+        logging.getLogger().warning(
+            f"Multiple disk image candidates found: {candidates}, "
+            f"picking the first one: {candidates[0]}"
+        )
+
+    return candidates[0]
+
+
 class VM:
     def __str__(self):
         return self.__class__.__name__
+
+    def render_optional_mgmt_config(self, template, **values):
+        """Render static management config only when all values are available."""
+        if not all(value and value != "dhcp" for value in values.values()):
+            return ""
+
+        for name, value in values.items():
+            template = template.replace(f"{{{name}}}", str(value))
+
+        return template
 
     def _overlay_disk_image_format(self) -> str:
         res = run_command(["qemu-img", "info", "--output", "json", self.image])
