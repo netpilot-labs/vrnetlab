@@ -2,16 +2,16 @@
 import datetime
 import logging
 import os
-import re
 import signal
 import subprocess
 import sys
-import uuid
 
 import vrnetlab
 
 # loadable startup config
 STARTUP_CONFIG_FILE = "/config/startup-config.cfg"
+# initial configuration rendered from the init.conf template on every start
+JUNIPER_CONFIG_FILE = "juniper.conf"
 
 
 def handle_SIGCHLD(signal, frame):
@@ -41,9 +41,7 @@ logging.Logger.trace = trace
 
 class VJUNOSSWITCH_vm(vrnetlab.VM):
     def __init__(self, hostname, username, password, conn_mode):
-        for e in os.listdir("/"):
-            if re.search(".qcow2$", e):
-                disk_image = "/" + e
+        disk_image = vrnetlab.find_disk_image()
         super(VJUNOSSWITCH_vm, self).__init__(
             username,
             password,
@@ -62,14 +60,30 @@ class VJUNOSSWITCH_vm(vrnetlab.VM):
         with open("init.conf", "r") as file:
             cfg = file.read()
 
-        cfg = cfg.replace("{MGMT_IP_IPV4}", self.mgmt_address_ipv4)
-        cfg = cfg.replace("{MGMT_GW_IPV4}", self.mgmt_gw_ipv4)
-        cfg = cfg.replace("{MGMT_IP_IPV6}", self.mgmt_address_ipv6)
-        cfg = cfg.replace("{MGMT_GW_IPV6}", self.mgmt_gw_ipv6)
-        cfg = cfg.replace("{HOSTNAME}", self.hostname)
+        ipv6_address_config = self.render_optional_mgmt_config(
+            "family inet6 {\n                address {address};\n            }",
+            address=self.mgmt_address_ipv6,
+        )
+        ipv6_route_config = self.render_optional_mgmt_config(
+            "rib mgmt_junos.inet6.0 {\n"
+            "                static {\n"
+            "                    route ::/0 next-hop {gateway};\n"
+            "                }\n"
+            "            }",
+            address=self.mgmt_address_ipv6,
+            gateway=self.mgmt_gw_ipv6,
+        )
+        cfg = (
+            cfg.replace("{MGMT_IP_IPV4}", self.mgmt_address_ipv4)
+            .replace("{MGMT_GW_IPV4}", self.mgmt_gw_ipv4)
+            .replace("{MGMT_IPV6_ADDRESS_CONFIG}", ipv6_address_config)
+            .replace("{MGMT_IPV6_ROUTE_CONFIG}", ipv6_route_config)
+            .replace("{HOSTNAME}", self.hostname)
+        )
 
-        # write changes to init.conf file
-        with open("init.conf", "w") as file:
+        # write the rendered config to juniper.conf, keep init.conf intact
+        # so that the container can be restarted
+        with open(JUNIPER_CONFIG_FILE, "w") as file:
             file.write(cfg)
 
         # pass in user startup config
@@ -77,8 +91,6 @@ class VJUNOSSWITCH_vm(vrnetlab.VM):
 
         # these QEMU cmd line args are translated from the shipped libvirt XML file
         self.qemu_args.extend(["-overcommit", "mem-lock=off"])
-        # generate UUID to attach
-        self.qemu_args.extend(["-uuid", str(uuid.uuid4())])
 
         # extend QEMU args with device USB details, xhci is most virtualization-friendly
         self.qemu_args.extend(["-device", "qemu-xhci,id=usb,bus=pci.0,addr=0x1.0x2"])
@@ -103,45 +115,55 @@ class VJUNOSSWITCH_vm(vrnetlab.VM):
     def startup_config(self):
         """Load additional config provided by user and append initial
         configurations set by vrnetlab."""
-        # if startup cfg DNE
-        if not os.path.exists(STARTUP_CONFIG_FILE):
-            self.logger.trace(f"Startup config file {STARTUP_CONFIG_FILE} is not found")
-            # rename init.conf to juniper.conf, this is our startup config
-            os.rename("init.conf", "juniper.conf")
-
-        # if startup cfg file is found
-        else:
+        # juniper.conf is (re)rendered from the pristine init.conf template on
+        # every start, so append the user startup config to it if it exists
+        if os.path.exists(STARTUP_CONFIG_FILE):
             self.logger.trace(
-                f"Startup config file {STARTUP_CONFIG_FILE} found, appending initial configuration"
+                f"Startup config file {STARTUP_CONFIG_FILE} found, appending to initial configuration"
             )
-            # append startup cfg to inital configuration
-            append_cfg = f"cat init.conf {STARTUP_CONFIG_FILE} >> juniper.conf"
-            subprocess.run(append_cfg, shell=True)
+            with open(STARTUP_CONFIG_FILE, "r") as file:
+                startup_cfg = file.read()
+            with open(JUNIPER_CONFIG_FILE, "a") as file:
+                file.write(startup_cfg)
 
         # generate mountable config disk based on juniper.conf file with base vrnetlab configs
-        subprocess.run(["./make-config.sh", "juniper.conf", "config.img"], check=True)
+        subprocess.run(["./make-config.sh", JUNIPER_CONFIG_FILE, "config.img"], check=True)
 
     def bootstrap_spin(self):
         """This function should be called periodically to do work."""
-        if self.spins > 300:
+        # Junos 26.x sends its boot output to /boot/console.log, so the serial
+        # console stays silent for ~10 min under nested virtualization — 300
+        # silent spins restarted a VM that was still booting, every time
+        # (golden-setup-vjunos-bench, 2026-10-28). Allow ~30 min of silence.
+        if self.spins > 1800:
             # too many spins with no result ->  give up
+            self.banner_seen = False
             self.stop()
             self.start()
             return
 
         # lets wait for the OS/platform log to determine if VM is booted,
         # login prompt can get lost in boot logs
-        (ridx, match, res) = self.tn.expect([b"FreeBSD/amd64"], 1)
-        if match:  # got a match!
-            if ridx == 0:  # login
+        # Once the banner is consumed, keep waiting for login: on later spins
+        # instead of expecting the banner again (a slow nested boot prints the
+        # prompt more than a second after it; Codex vrnetlab#4).
+        if not getattr(self, "banner_seen", False):
+            (ridx, match, res) = self.tn.expect([b"FreeBSD/amd64"], 1)
+            if match:
                 self.logger.info("VM started")
-
-                # Login
+                self.banner_seen = True
                 self.wait_write("\r", None)
-                self.wait_write("admin", wait="login:")
-                self.wait_write(self.password, wait="Password:")
+        else:
+            res = b""
+        if getattr(self, "banner_seen", False):
+            (_, loginMatch, login_res) = self.tn.expect([b"login:"], 1)
+            res = res + (login_res or b"")
+            if not loginMatch and login_res == b"" and self.spins % 30 == 29:
+                # nudge the console in case the prompt was printed before
+                # we started waiting for it
                 self.wait_write("\r", None)
-                self.logger.info("Login completed")
+            if loginMatch:
+                self.logger.info("Login prompt found")
 
                 # close telnet connection
                 self.tn.close()
