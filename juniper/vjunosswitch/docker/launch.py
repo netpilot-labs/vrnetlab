@@ -137,32 +137,42 @@ class VJUNOSSWITCH_vm(vrnetlab.VM):
         # (golden-setup-vjunos-bench, 2026-10-28). Allow ~30 min of silence.
         if self.spins > 1800:
             # too many spins with no result ->  give up
+            self.banner_seen = False
             self.stop()
             self.start()
             return
 
         # lets wait for the OS/platform log to determine if VM is booted,
         # login prompt can get lost in boot logs
-        (ridx, match, res) = self.tn.expect([b"FreeBSD/amd64"], 1)
-        if match:  # got a match!
-            if ridx == 0:  # login
+        # Once the banner is consumed, keep waiting for login: on later spins
+        # instead of expecting the banner again (a slow nested boot prints the
+        # prompt more than a second after it; Codex vrnetlab#4).
+        if not getattr(self, "banner_seen", False):
+            (ridx, match, res) = self.tn.expect([b"FreeBSD/amd64"], 1)
+            if match:
                 self.logger.info("VM started")
-
-                # Login
+                self.banner_seen = True
                 self.wait_write("\r", None)
+        else:
+            res = b""
+        if getattr(self, "banner_seen", False):
+            (_, loginMatch, login_res) = self.tn.expect([b"login:"], 1)
+            res = res + (login_res or b"")
+            if not loginMatch and login_res == b"" and self.spins % 30 == 29:
+                # nudge the console in case the prompt was printed before
+                # we started waiting for it
+                self.wait_write("\r", None)
+            if loginMatch:
+                self.logger.info("Login prompt found")
 
-                _, loginMatch, _ = self.tn.expect([b"login:"], 1)
-                if loginMatch:
-                    self.logger.info("Login prompt found")
-
-                    # close telnet connection
-                    self.tn.close()
-                    # startup time?
-                    startup_time = datetime.datetime.now() - self.start_time
-                    self.logger.info("Startup complete in: %s" % startup_time)
-                    # mark as running
-                    self.running = True
-                    return
+                # close telnet connection
+                self.tn.close()
+                # startup time?
+                startup_time = datetime.datetime.now() - self.start_time
+                self.logger.info("Startup complete in: %s" % startup_time)
+                # mark as running
+                self.running = True
+                return
 
         # no match, if we saw some output from the router it's probably
         # booting, so let's give it some more time
