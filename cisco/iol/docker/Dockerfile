@@ -1,8 +1,5 @@
 FROM public.ecr.aws/docker/library/debian:bookworm-slim
 
-# Version passed from makefile (e.g., "17.12.01" or "L2-17.12.01")
-ARG VERSION
-
 # Install dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -13,29 +10,15 @@ RUN apt-get update && \
     curl \
     ca-certificates \
     gnupg \
-    # Python3 for gen_license.py
-    python3 \
-    # 32-bit libraries for legacy IOL 15.x (32-bit binary)
-    libc6-i386 \
-    lib32z1 \
-    lib32gcc-s1 \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get clean
 
 # Add containerlab gemfury for custom IOUYAP
 RUN echo "deb [trusted=yes] https://netdevops.fury.site/apt/ /" | \
-    sudo tee -a /etc/apt/sources.list.d/netdevops.list
+sudo tee -a /etc/apt/sources.list.d/netdevops.list
 
 # Update and install IOUYAP
 RUN apt-get update && \
-    apt-get install -y iouyap \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy custom scripts for IOL 15.x support
-COPY gen_license.py /gen_license.py
-COPY iou_import /iou_import
-RUN chmod +x /gen_license.py /iou_import
+    apt-get install -y iouyap
 
 # Copy the entrypoint script
 COPY entrypoint.sh /entrypoint.sh
@@ -47,15 +30,7 @@ WORKDIR /iol
 # Add the IOL image and config files
 COPY *.bin /iol/iol.bin
 
-# Make the IOL image executable
+# Make the IOL image and script executable
 RUN chmod +x /iol/iol.bin
-
-# Write IOL_TYPE to file based on VERSION (L2 images have "L2" in version)
-# This allows entrypoint.sh to detect L2 vs L3 at runtime
-RUN if echo "${VERSION}" | grep -qi "L2"; then \
-        echo "L2" > /iol/iol_type; \
-    else \
-        echo "L3" > /iol/iol_type; \
-    fi
 
 ENTRYPOINT ["/entrypoint.sh"]
