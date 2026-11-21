@@ -11,6 +11,12 @@ import time
 import vrnetlab
 
 STARTUP_CONFIG_FILE = "/config/startup-config.cfg"
+# Seconds a startup-config line may take to return the prompt before the
+# injection gives up with an error line instead of hanging the boot.
+STARTUP_LINE_TIMEOUT = 120
+# AOS-CX confirmation questions: "Do you want to create (y/n)? ",
+# "Do you want to continue (y/n)? ", "Do you want to continue? (y/n)? ".
+YN_QUESTION = rb"\(y/n\)\??\s*$"
 
 def handle_SIGCHLD(signal, frame):
     os.waitpid(-1, os.WNOHANG)
@@ -80,12 +86,18 @@ class AOSCX_vm(vrnetlab.VM):
 
                 # run main config!
                 self.bootstrap_config()
-                self.startup_config()
+                applied = self.startup_config()
                 # close telnet connection
                 self.tn.close()
                 # startup time?
                 startup_time = datetime.datetime.now() - self.start_time
-                self.logger.info("Startup complete in: %s" % startup_time)
+                if applied:
+                    self.logger.info("Startup complete in: %s" % startup_time)
+                else:
+                    self.logger.error(
+                        f"Startup complete in: {startup_time}, startup-config NOT "
+                        "fully applied (see 'startup-config stalled' above)"
+                    )
                 # mark as running
                 self.running = True
                 return
@@ -128,11 +140,14 @@ class AOSCX_vm(vrnetlab.VM):
         self.wait_write("")
 
     def startup_config(self):
-        """Load additional config provided by user."""
+        """Load additional config provided by user.
+
+        Returns False when the injection stalled before every line landed.
+        """
 
         if not os.path.exists(STARTUP_CONFIG_FILE):
             self.logger.trace(f"Startup config file {STARTUP_CONFIG_FILE} is not found")
-            return
+            return True
 
         self.logger.trace(f"Startup config file {STARTUP_CONFIG_FILE} exists")
         with open(STARTUP_CONFIG_FILE) as file:
@@ -143,12 +158,42 @@ class AOSCX_vm(vrnetlab.VM):
         self.logger.info(f"Writing lines from {STARTUP_CONFIG_FILE}")
 
         self.wait_write("configure")
-        # Apply lines from file
-        for line in config_lines:
-            self.wait_write(line)
+        # Apply lines from file. Each line waits for the prompt of the one
+        # before it; a (y/n) question in between (e.g. an interface naming an
+        # OSPF area that does not exist yet) is answered "y".
+        sent = "configure"
+        for num, line in enumerate(config_lines + [None], start=1):
+            if not self.wait_prompt(STARTUP_LINE_TIMEOUT):
+                self.logger.error(
+                    f"startup-config stalled: no prompt within {STARTUP_LINE_TIMEOUT}s "
+                    f"after '{sent}'; {len(config_lines) - num + 1} later line(s) "
+                    "not applied"
+                )
+                return False
+            if line is None:
+                break
+            self.logger.debug(f"writing to serial console: '{line}'")
+            self.tn.write(f"{line}\r".encode())
+            sent = line
         # End and Save
-        self.wait_write("end")
+        self.tn.write(b"end\r")
         self.wait_write("write memory")
+        return True
+
+    def wait_prompt(self, timeout):
+        """Wait for the '#' prompt, answering any (y/n) question with 'y'.
+
+        Returns False when neither shows within `timeout` seconds.
+        """
+        while True:
+            self.logger.info("waiting for '#' or a (y/n) question on serial console")
+            ridx, _, res = self.tn.expect([YN_QUESTION, b"#"], timeout)
+            self.logger.info(f"read from serial console: '{res.decode(errors='replace')}'")
+            if ridx == 0:
+                self.logger.info("answering 'y' to the (y/n) question")
+                self.tn.write(b"y\r")
+                continue
+            return ridx == 1
 
 
 class AOSCX(vrnetlab.VR):
