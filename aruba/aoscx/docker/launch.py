@@ -158,25 +158,29 @@ class AOSCX_vm(vrnetlab.VM):
         self.logger.info(f"Writing lines from {STARTUP_CONFIG_FILE}")
 
         self.wait_write("configure")
-        # Apply lines from file. Each line waits for the prompt of the one
-        # before it; a (y/n) question in between (e.g. an interface naming an
-        # OSPF area that does not exist yet) is answered "y".
-        sent = "configure"
-        for num, line in enumerate(config_lines + [None], start=1):
+        # The bootstrap leaves stale prompts on the console: skip to the
+        # config-mode prompt so each '#' read below answers the line just sent.
+        ridx, _, res = self.tn.expect([rb"\(config\)#"], STARTUP_LINE_TIMEOUT)
+        self.logger.info(f"read from serial console: '{res.decode(errors='replace')}'")
+        if ridx != 0:
+            self.logger.error(
+                f"startup-config stalled: no config prompt within {STARTUP_LINE_TIMEOUT}s; "
+                f"{len(config_lines)} line(s) not applied"
+            )
+            return False
+        # Apply lines from file. A (y/n) question a line raises (e.g. an
+        # interface naming an OSPF area that does not exist yet) is answered "y".
+        for num, line in enumerate(config_lines, start=1):
+            self.logger.debug(f"writing to serial console: '{line}'")
+            self.tn.write(f"{line}\r".encode())
             if not self.wait_prompt(STARTUP_LINE_TIMEOUT):
                 self.logger.error(
                     f"startup-config stalled: no prompt within {STARTUP_LINE_TIMEOUT}s "
-                    f"after '{sent}'; {len(config_lines) - num + 1} later line(s) "
-                    "not applied"
+                    f"after '{line}'; {len(config_lines) - num} later line(s) not applied"
                 )
                 return False
-            if line is None:
-                break
-            self.logger.debug(f"writing to serial console: '{line}'")
-            self.tn.write(f"{line}\r".encode())
-            sent = line
         # End and Save
-        self.tn.write(b"end\r")
+        self.wait_write("end", wait=None)
         self.wait_write("write memory")
         return True
 
