@@ -62,6 +62,7 @@ class VJUNOSSWITCH_vm(vrnetlab.VM):
 
         self.amnesiac_retried = False
         self.console_since_banner = b""
+        self.console_tail = b""
         self.render_config()
 
         # these QEMU cmd line args are translated from the shipped libvirt XML file
@@ -161,11 +162,21 @@ class VJUNOSSWITCH_vm(vrnetlab.VM):
         # prompt more than a second after it; Codex vrnetlab#4).
         if not getattr(self, "banner_seen", False):
             (ridx, match, res) = self.tn.expect([b"FreeBSD/amd64"], 1)
-            if match:
+            # expect() drops what it read on a timeout, so a banner split
+            # across two reads ("FreeBSD/amd" | "64 (r1) (ttyu0)") never
+            # matched and the boot waited for the silence restart (bench,
+            # containerlab-mcp#493): search a rolling tail as well
+            tail = (self.console_tail + (res or b""))[-1024:]
+            if match or b"FreeBSD/amd64" in tail:
                 self.logger.info("VM started")
                 self.banner_seen = True
-                self.console_since_banner = b""
+                self.console_since_banner = (
+                    b"" if match else tail[tail.rfind(b"FreeBSD/amd64") :]
+                )
+                self.console_tail = b""
                 self.wait_write("\r", None)
+            else:
+                self.console_tail = tail
         else:
             res = b""
         if getattr(self, "banner_seen", False):
@@ -241,6 +252,7 @@ class VJUNOSSWITCH_vm(vrnetlab.VM):
                 check=True,
             )
         self.banner_seen = False
+        self.console_tail = b""
         self.spins = 0
         self.start()
 
