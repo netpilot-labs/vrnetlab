@@ -2,6 +2,7 @@
 import datetime
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -12,6 +13,10 @@ import vrnetlab
 STARTUP_CONFIG_FILE = "/config/startup-config.cfg"
 # initial configuration rendered from the init.conf template on every start
 JUNIPER_CONFIG_FILE = "juniper.conf"
+# the console login banner of a Junos that booted without applying juniper.conf:
+# "FreeBSD/amd64 (Amnesiac) (ttyu0)" instead of the configured host name
+AMNESIAC_BANNER = re.compile(rb"\(Amnesiac\)\s*\(tty")
+AMNESIAC_ERROR = "Junos booted Amnesiac: the startup configuration was not applied"
 
 
 def handle_SIGCHLD(signal, frame):
@@ -55,6 +60,36 @@ class VJUNOSSWITCH_vm(vrnetlab.VM):
         # device hostname
         self.hostname = hostname
 
+        self.amnesiac_retried = False
+        self.console_since_banner = b""
+        self.render_config()
+
+        # these QEMU cmd line args are translated from the shipped libvirt XML file
+        self.qemu_args.extend(["-overcommit", "mem-lock=off"])
+
+        # extend QEMU args with device USB details, xhci is most virtualization-friendly
+        self.qemu_args.extend(["-device", "qemu-xhci,id=usb,bus=pci.0,addr=0x1.0x2"])
+
+        # mount config disk with juniper.conf base configs
+        self.qemu_args.extend(
+            [
+                "-drive",
+                "file=/config.img,format=raw,if=none,id=config_disk",
+                "-device",
+                "usb-storage,drive=config_disk,id=usb-disk0,removable=off,write-cache=on",
+            ]
+        )
+
+        self.qemu_args.extend(["-no-user-config", "-nodefaults", "-boot", "strict=on"])
+        self.nic_type = "virtio-net-pci"
+        # 1 management port + 48 front ports + 8 uplink ports to match most dense 1U Juniper switch
+        self.num_nics = 57
+        self.smbios = ["type=1,product=VM-VEX"]
+        self.conn_mode = conn_mode
+
+    def render_config(self):
+        """Render juniper.conf from the init.conf template plus the user
+        startup config, and build the config disk from it."""
         # read init.conf configuration file to replace hostname placehodler
         # with given hostname
         with open("init.conf", "r") as file:
@@ -88,29 +123,6 @@ class VJUNOSSWITCH_vm(vrnetlab.VM):
 
         # pass in user startup config
         self.startup_config()
-
-        # these QEMU cmd line args are translated from the shipped libvirt XML file
-        self.qemu_args.extend(["-overcommit", "mem-lock=off"])
-
-        # extend QEMU args with device USB details, xhci is most virtualization-friendly
-        self.qemu_args.extend(["-device", "qemu-xhci,id=usb,bus=pci.0,addr=0x1.0x2"])
-
-        # mount config disk with juniper.conf base configs
-        self.qemu_args.extend(
-            [
-                "-drive",
-                "file=/config.img,format=raw,if=none,id=config_disk",
-                "-device",
-                "usb-storage,drive=config_disk,id=usb-disk0,removable=off,write-cache=on",
-            ]
-        )
-
-        self.qemu_args.extend(["-no-user-config", "-nodefaults", "-boot", "strict=on"])
-        self.nic_type = "virtio-net-pci"
-        # 1 management port + 48 front ports + 8 uplink ports to match most dense 1U Juniper switch
-        self.num_nics = 57
-        self.smbios = ["type=1,product=VM-VEX"]
-        self.conn_mode = conn_mode
 
     def startup_config(self):
         """Load additional config provided by user and append initial
@@ -152,18 +164,39 @@ class VJUNOSSWITCH_vm(vrnetlab.VM):
             if match:
                 self.logger.info("VM started")
                 self.banner_seen = True
+                self.console_since_banner = b""
                 self.wait_write("\r", None)
         else:
             res = b""
         if getattr(self, "banner_seen", False):
             (_, loginMatch, login_res) = self.tn.expect([b"login:"], 1)
             res = res + (login_res or b"")
+            if not loginMatch:
+                # keep the tail: the "(Amnesiac)" banner can arrive a spin
+                # before the login: prompt it belongs to
+                self.console_since_banner = (
+                    self.console_since_banner + (login_res or b"")
+                )[-4096:]
             if not loginMatch and login_res == b"" and self.spins % 30 == 29:
                 # nudge the console in case the prompt was printed before
                 # we started waiting for it
                 self.wait_write("\r", None)
             if loginMatch:
                 self.logger.info("Login prompt found")
+                if AMNESIAC_BANNER.search(self.console_since_banner + login_res):
+                    if not self.amnesiac_retried:
+                        self.logger.error(
+                            f"{AMNESIAC_ERROR}; restarting the VM once with a freshly rendered config disk"
+                        )
+                        self.amnesiac_retried = True
+                        self.tn.close()
+                        self.retry_fresh_boot()
+                        return
+                    # a startup file Junos rejects stays Amnesiac on every boot
+                    self.logger.error(
+                        f"{AMNESIAC_ERROR} (again after one retry): check the startup configuration "
+                        "for a statement Junos rejects; the node has no management address"
+                    )
 
                 # close telnet connection
                 self.tn.close()
@@ -184,6 +217,40 @@ class VJUNOSSWITCH_vm(vrnetlab.VM):
         self.spins += 1
 
         return
+
+    def retry_fresh_boot(self):
+        """Boot again as a first boot: a freshly rendered config disk and a
+        new overlay, the same as a redeploy of the node."""
+        self.stop()
+        self.render_config()
+        overlay = self.overlay_disk_image()
+        if overlay:
+            os.remove(overlay)
+            subprocess.run(
+                [
+                    "qemu-img",
+                    "create",
+                    "-f",
+                    "qcow2",
+                    "-F",
+                    self._overlay_disk_image_format(),
+                    "-b",
+                    self.image,
+                    overlay,
+                ],
+                check=True,
+            )
+        self.banner_seen = False
+        self.spins = 0
+        self.start()
+
+    def overlay_disk_image(self):
+        """The overlay qcow2 the -drive argument boots, or None."""
+        for arg in self.qemu_args:
+            m = re.match(r"if=\w+,file=(\S+-overlay\.qcow2)$", arg)
+            if m and os.path.exists(m.group(1)):
+                return m.group(1)
+        return None
 
 
 class VJUNOSSWITCH(vrnetlab.VR):
