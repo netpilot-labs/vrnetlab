@@ -26,3 +26,5 @@ cisco*.bin
 
 # ignore clab- dirs
 clab-*
+__pycache__/
+*.pyc
