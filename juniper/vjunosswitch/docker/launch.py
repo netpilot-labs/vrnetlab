@@ -56,6 +56,8 @@ class VJUNOSSWITCH_vm(vrnetlab.VM):
             cpu="host",
             smp="4,sockets=1,cores=4,threads=1",
             mgmt_passthrough=False,
+            # no data link → no NIC → the FPC never boots (900 s BOOT_TIMEOUT loop): one dummy NIC (clab#507)
+            min_dp_nics=1,
         )
         # device hostname
         self.hostname = hostname
